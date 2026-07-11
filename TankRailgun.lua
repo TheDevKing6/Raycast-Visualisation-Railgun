@@ -1,27 +1,66 @@
 -- gets roblox services for script access
 local runservice = game:GetService("RunService")
 local workspace = game:GetService("Workspace")
+local tweenservice = game:GetService("TweenService")
 
 -- finds the railgun model
 local rig = workspace:FindFirstChild("RailgunRig")
 
+-- stops the script immediately if the rig is missing instead of erroring later on a nil field
+if not rig then
+	error("railgun script could not find RailgunRig in workspace")
+end
+
+-- looks up a named descendant safely
+-- tries the cheap direct child lookup first, only falls back to a full recursive scan if that fails
+-- this avoids paying the cost of scanning the whole descendant tree every time a part is a direct child
+-- also raises a clear error instead of letting a missing part turn into a silent nil further down
+local function safefind(root, name, class)
+
+	-- tries the direct child lookup first, this is the cheap path
+	local found = root:FindFirstChild(name)
+
+	-- only falls back to a recursive scan if the direct lookup came up empty
+	if not found then
+		found = root:FindFirstChild(name, true)
+	end
+
+	-- stops the script with a clear message rather than returning nil to the caller
+	if not found then
+		error("railgun script could not find '" .. name .. "' under " .. root:GetFullName())
+	end
+
+	-- optionally checks the found instance is actually the expected class
+	if class and not found:IsA(class) then
+		error("railgun script found '" .. name .. "' but it is not a " .. class)
+	end
+
+	-- returns the verified instance
+	return found
+end
+
 -- finds railgun base part
-local base = rig:FindFirstChild("Base", true)
+local base = safefind(rig, "Base", "BasePart")
 
 -- finds rotating turret section
-local turret = rig:FindFirstChild("Turret", true)
+local turret = safefind(rig, "Turret", "BasePart")
 
 -- finds barrel object
-local barrel = rig:FindFirstChild("Barrel", true)
+local barrel = safefind(rig, "Barrel", "BasePart")
 
 -- finds player control seat
-local seat = rig:FindFirstChild("Seat", true)
+local seat = safefind(rig, "Seat", "Seat")
 
 -- finds bullet spawn position
-local muzzle = rig:FindFirstChild("Muzzle", true)
+local muzzle = safefind(rig, "Muzzle", "BasePart")
 
--- finds hinge rotation constraint
-local hinge = rig:FindFirstChildWhichIsA("HingeConstraint", true)
+-- finds rotation constraint, tries a direct child search first then falls back to a recursive scan
+local hinge = rig:FindFirstChildWhichIsA("HingeConstraint") or rig:FindFirstChildWhichIsA("HingeConstraint", true)
+
+-- stops the script early since the firing and turning logic both depend on this constraint existing
+if not hinge then
+	error("railgun script could not find a HingeConstraint under " .. rig:GetFullName())
+end
 
 -- sets model movement reference part
 rig.PrimaryPart = base
@@ -31,6 +70,9 @@ hinge.Attachment0.Axis = Vector3.new(0,1,0)
 
 -- sets second hinge rotation axis
 hinge.Attachment1.Axis = Vector3.new(0,1,0)
+
+-- remembers the turret's resting cframe so the recoil kick always has somewhere to return to
+local turretrestcframe = turret.CFrame
 
 -- stores configurable weapon settings
 local config = {
@@ -91,6 +133,33 @@ local config = {
 
 	-- reduced spread while charging
 	charge_spread_mult = 0.55,
+
+	-- maximum heat before the weapon refuses to fire
+	max_heat = 100,
+
+	-- heat added per normal shot
+	heat_per_shot = 18,
+
+	-- heat added per fully charged shot
+	heat_per_charged_shot = 32,
+
+	-- heat lost per second while not firing
+	heat_cooldown_rate = 40,
+
+	-- distance at which impulse falloff begins
+	impulse_falloff_start = 250,
+
+	-- distance at which impulse falloff reaches its floor
+	impulse_falloff_end = 700,
+
+	-- lowest fraction of impulse strength allowed at long range
+	impulse_falloff_floor = 0.25,
+
+	-- how far back the turret nudges visually on fire
+	recoil_offset = 0.35,
+
+	-- how long the recoil kick and return animation takes
+	recoil_time = 0.12,
 }
 
 -- colour for bouncing laser segments
@@ -99,11 +168,17 @@ local bounce_color = Color3.fromRGB(0, 255, 0)
 -- colour for stopping laser segments
 local stop_color = Color3.fromRGB(255, 0, 0)
 
--- creates debug visuals folder
-local debugfolder = workspace:FindFirstChild("_RailgunDebug") or Instance.new("Folder", workspace)
+-- finds or builds the debug visuals folder
+local debugfolder = workspace:FindFirstChild("_RailgunDebug")
 
--- names the debug folder
-debugfolder.Name = "_RailgunDebug"
+-- builds the folder fresh only if one does not already exist
+-- creates it unparented first and assigns the parent last, since setting the parent inside
+-- instance.new is a deprecated pattern that costs more performance than setting properties first
+if not debugfolder then
+	debugfolder = Instance.new("Folder")
+	debugfolder.Name = "_RailgunDebug"
+	debugfolder.Parent = workspace
+end
 
 -- creates raycast configuration object
 local rayparams = RaycastParams.new()
@@ -120,7 +195,7 @@ rayparams.FilterDescendantsInstances = { rig, debugfolder }
 -- creates reusable visual beam part
 local function makepart(size)
 
-	-- creates new part instance
+	-- creates new part instance, properties are set before it ever gets a parent
 	local p = Instance.new("Part")
 
 	-- locks part in position
@@ -144,7 +219,7 @@ local function makepart(size)
 	-- sets visual part size
 	p.Size = size
 
-	-- returns completed visual part
+	-- returns completed visual part, parent is assigned later by whoever uses it
 	return p
 end
 
@@ -360,15 +435,38 @@ local function randomdisk()
 	)
 end
 
--- pushes unanchored physical objects
-local function applyimpulse(part, pos, dir)
+-- calculates how much impulse strength survives over distance
+-- close hits keep full strength, hits past the falloff end only keep the floor fraction
+local function falloff(distance)
+
+	-- returns full strength for anything inside the near range
+	if distance <= config.impulse_falloff_start then
+		return 1
+	end
+
+	-- returns the floor fraction for anything past the far range
+	if distance >= config.impulse_falloff_end then
+		return config.impulse_falloff_floor
+	end
+
+	-- interpolates linearly between full strength and the floor fraction
+	local span = config.impulse_falloff_end - config.impulse_falloff_start
+	local t = (distance - config.impulse_falloff_start) / span
+	return 1 - t * (1 - config.impulse_falloff_floor)
+end
+
+-- pushes unanchored physical objects, scaled down the further the beam had to travel to reach them
+local function applyimpulse(part, pos, dir, traveled)
 
 	-- checks if object movable
 	if part and part:IsA("BasePart") and not part.Anchored then
 
+		-- works out how much of the base impulse strength survives at this range
+		local scale = falloff(traveled or 0)
+
 		-- applies directional physical force
 		part:ApplyImpulseAtPosition(
-			dir * part.AssemblyMass * config.impulse_strength,
+			dir * part.AssemblyMass * config.impulse_strength * scale,
 			pos
 		)
 	end
@@ -431,6 +529,9 @@ local function cast(origin, dir)
 	-- stores remaining bounce count
 	local bounces = config.max_bounces
 
+	-- tracks total distance travelled so far, used for impulse falloff at the final hit
+	local totaldist = 0
+
 	-- continues while range remains
 	while remain > 0 do
 
@@ -489,6 +590,9 @@ local function cast(origin, dir)
 			-- subtracts used beam range
 			remain -= traveled
 
+			-- keeps a running total for falloff calculations later
+			totaldist += traveled
+
 			-- calculates reflected bounce direction
 			d = unit(reflect(d, n))
 
@@ -507,13 +611,51 @@ local function cast(origin, dir)
 			-- creates stopping hit marker
 			spawnhit(hitpos, stop_color)
 
-			-- pushes hit physical object
-			applyimpulse(part, hitpos, d)
+			-- adds the final leg of the journey to the running total before applying impulse
+			totaldist += (hitpos - pos).Magnitude
+
+			-- pushes hit physical object, weaker the further the beam had to travel
+			applyimpulse(part, hitpos, d, totaldist)
 
 			-- exits bounce simulation loop
 			break
 		end
 	end
+end
+
+-- plays a short cosmetic recoil kick on the turret using tweenservice rather than manual per-frame lerping
+-- note this only nudges the part's cframe for visual feedback, it is not a physical recoil force
+local function playrecoil()
+
+	-- exits early if visuals are turned off
+	if not config.visual_enabled then
+		return
+	end
+
+	-- calculates the kicked back cframe relative to the turret's resting position
+	local kicked = turretrestcframe * CFrame.new(0, 0, config.recoil_offset)
+
+	-- builds the tween that snaps back quickly on fire
+	local kicktween = tweenservice:Create(
+		turret,
+		TweenInfo.new(config.recoil_time * 0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ CFrame = kicked }
+	)
+
+	-- builds the tween that eases forward again to the resting position
+	local returntween = tweenservice:Create(
+		turret,
+		TweenInfo.new(config.recoil_time * 0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		{ CFrame = turretrestcframe }
+	)
+
+	-- chains the return tween to start once the kick finishes
+	kicktween.Completed:Connect(function()
+		returntween:Play()
+	end)
+
+	-- starts the kick immediately
+	kicktween:Play()
 end
 
 -- stores previous fire timestamp
@@ -528,6 +670,9 @@ local charge = 0
 -- tracks charging state activity
 local wascharging = false
 
+-- stores current weapon heat, rises with each shot and cools down over time
+local heat = 0
+
 -- handles normal weapon firing
 local function fire()
 
@@ -539,8 +684,19 @@ local function fire()
 		return
 	end
 
+	-- blocks firing entirely once the weapon has overheated
+	if heat >= config.max_heat then
+		return
+	end
+
 	-- updates last fired timestamp
 	lastfire = t
+
+	-- adds heat for this shot, capped at the maximum
+	heat = math.min(config.max_heat, heat + config.heat_per_shot)
+
+	-- plays the cosmetic recoil kick
+	playrecoil()
 
 	-- fires beam from muzzle
 	cast(
@@ -560,11 +716,19 @@ local function firecharged(chargealpha)
 		return
 	end
 
+	-- blocks firing entirely once the weapon has overheated
+	if heat >= config.max_heat then
+		return
+	end
+
 	-- updates last fired timestamp
 	lastfire = t
 
 	-- clamps charge amount safely
 	local a = math.clamp(chargealpha or 0, 0, 1)
+
+	-- adds heat for this shot, scaled slightly by how charged it was, capped at the maximum
+	heat = math.min(config.max_heat, heat + config.heat_per_charged_shot * (0.5 + 0.5 * a))
 
 	-- stores original beam range
 	local oldrange = config.max_range
@@ -583,6 +747,9 @@ local function firecharged(chargealpha)
 		config.impulse_strength =
 			oldimpulse * (1 + a * config.charge_impulse_mult)
 	end
+
+	-- plays the cosmetic recoil kick
+	playrecoil()
 
 	-- fires charged beam shot
 	cast(
@@ -632,8 +799,8 @@ runservice.Heartbeat:Connect(function(dt)
 			wascharging = true
 		elseif wascharging then
 
-			-- checks if charge sufficient
-			if charge >= config.min_charge_to_fire then
+			-- checks if charge sufficient and the weapon has room to fire before overheating
+			if charge >= config.min_charge_to_fire and heat < config.max_heat then
 
 				-- fires charged weapon shot
 				firecharged(charge)
@@ -657,6 +824,9 @@ runservice.Heartbeat:Connect(function(dt)
 
 	-- stores previous throttle state
 	lastthrottle = throttle
+
+	-- cools the weapon down over time whenever it is not actively adding heat
+	heat = math.max(0, heat - config.heat_cooldown_rate * dt)
 
 	-- removes expired visual effects
 	cleanup()
