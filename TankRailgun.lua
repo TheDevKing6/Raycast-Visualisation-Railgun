@@ -1,3 +1,7 @@
+--previous application was denied for not having this so here you go:
+--ghxst_rider.exe (discord) and TheDevKing6 (roblox)
+
+
 -- gets roblox services for script access
 local runservice = game:GetService("RunService")
 local workspace = game:GetService("Workspace")
